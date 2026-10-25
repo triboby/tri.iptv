@@ -17,8 +17,8 @@ data class LineStat(
 
     /**
      * Whether the line showed an advert within [AD_HOLD_MS] before [now]. The redirect servers
-     * behind such lines send only some requests to the advert, so a line that worked on the next
-     * probe is still kept back for a while.
+     * behind such lines send only some requests to the advert, so a line that worked on a later
+     * probe is still ranked after lines that never showed one.
      */
     fun adRecently(now: Long): Boolean = adAt > 0L && now - adAt < AD_HOLD_MS
 
@@ -50,17 +50,20 @@ object LineRanker {
     /**
      * Indices into [urls] in the order to try them: the line the viewer picked (unless it has
      * since failed), then working lines fastest first, then lines not checked yet, then lines
-     * whose last check failed, those that worked most recently first, and last lines that showed
-     * an advert lately, even if picked or working since. Ties keep the playlist order.
+     * whose last check failed, those that worked most recently first. A line that showed an
+     * advert lately ranks after the clean working lines once it has worked again (the player
+     * checks it on every load), and last of all while its latest check was the advert; it stays
+     * first only when picked and working since. Ties keep the playlist order.
      */
     fun order(urls: List<String>, stats: Map<String, LineStat>, picked: String?, now: Long = System.currentTimeMillis()): List<Int> {
         fun tier(i: Int): Int {
             val s = stats[urls[i]]
             return when {
-                s?.adRecently(now) == true -> 4
                 urls[i] == picked && s?.failing != true -> 0
-                s == null || s.checkedAt == 0L -> 2
-                s.failing -> 3
+                s == null || s.checkedAt == 0L -> 3
+                s.failing && s.adRecently(now) -> 5
+                s.failing -> 4
+                s.adRecently(now) -> 2
                 else -> 1
             }
         }

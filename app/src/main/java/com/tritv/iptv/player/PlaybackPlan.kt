@@ -77,9 +77,10 @@ internal fun probeSwitch(
 }
 
 /**
- * The attempt to move to once attempt [current] has shown an advert: the first attempt of a line
- * after it that is not known dead or an advert, else one before it (the viewer may have stepped
- * past them), else null when none is left.
+ * The attempt to move to once attempt [current] has shown an advert: the first attempt of another
+ * line, after it and then before it (the viewer may have stepped past them), preferring lines
+ * neither dead nor seen with an advert lately, then ones that worked since their advert (the
+ * player checks them as it loads), then any not last seen as an advert. Null when none is left.
  */
 internal fun nextLineAfterAd(
     attempts: List<Attempt>,
@@ -89,14 +90,15 @@ internal fun nextLineAfterAd(
     now: Long,
 ): Int? {
     val line = attempts[current].sourceIndex
-    fun usable(i: Int): Boolean {
-        val s = stats[lineUrls[attempts[i].sourceIndex]]
-        return attempts[i].sourceIndex != line && s?.adRecently(now) != true
-    }
+    fun statOf(i: Int) = stats[lineUrls[attempts[i].sourceIndex]]
     fun firstOfLine(i: Int) = i == 0 || attempts[i - 1].sourceIndex != attempts[i].sourceIndex
-    val candidates = (current + 1 until attempts.size) + (0 until current)
-    return candidates.firstOrNull { usable(it) && firstOfLine(it) && stats[lineUrls[attempts[it].sourceIndex]]?.failing != true }
-        ?: candidates.firstOrNull { usable(it) && firstOfLine(it) }
+    val candidates = ((current + 1 until attempts.size) + (0 until current))
+        .filter { attempts[it].sourceIndex != line && firstOfLine(it) }
+    fun ad(i: Int) = statOf(i)?.adRecently(now) == true
+    fun failing(i: Int) = statOf(i)?.failing == true
+    return candidates.firstOrNull { !ad(it) && !failing(it) }
+        ?: candidates.firstOrNull { ad(it) && !failing(it) }
+        ?: candidates.firstOrNull { !ad(it) }
 }
 
 /** A short Chinese reason for the error that ended the last line, for the player's info bar. */

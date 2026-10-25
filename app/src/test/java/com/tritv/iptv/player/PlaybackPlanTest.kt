@@ -112,5 +112,8 @@ class ProbeSwitchTest {
         assertEquals(0, nextLineAfterAd(attempts, urls, emptyMap(), current = 2, now = 2_000))
         val allAds = urls.associateWith { LineStat(failAt = 1_900, adAt = 1_900) }
         assertNull(nextLineAfterAd(attempts, urls, allAds, current = 0, now = 2_000))
+        // A line that worked since its advert is still worth a try.
+        val recovered = allAds + ("c" to LineStat(okAt = 1_950, failAt = 1_900, adAt = 1_900))
+        assertEquals(2, nextLineAfterAd(attempts, urls, recovered, current = 0, now = 2_000))
     }
 }

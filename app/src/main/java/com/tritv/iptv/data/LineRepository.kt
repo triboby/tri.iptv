@@ -84,14 +84,19 @@ class LineRepository(context: Context) {
      */
     fun reportAd(entry: PlaylistEntry) {
         Log.i(TAG, "play showed ad " + entry.url)
-        recordAd(entry.url)
+        recordAd(entry.url, dropPick = true)
     }
 
-    private fun recordAd(url: String) {
+    /**
+     * Only the player drops the viewer's pick: a probe's advert keeps the line from going first
+     * until it works again, and the player checks it on every load anyway.
+     */
+    private fun recordAd(url: String, dropPick: Boolean) {
         val now = System.currentTimeMillis()
         _stats.update { all -> all + (url to (all[url] ?: LineStat()).showedAd(now)) }
         unsaved += url
         saveSoon()
+        if (!dropPick) return
         val picks = pickPrefs.all.filterValues { it == url }.keys
         if (picks.isNotEmpty()) pickPrefs.edit().apply { picks.forEach { remove(it) } }.apply()
     }
@@ -160,7 +165,7 @@ class LineRepository(context: Context) {
         try {
             when (val result = probe(entry)) {
                 is LineProbe.Result.Ok -> record(entry.url, ok = true, latency = result.latencyMs)
-                LineProbe.Result.Ad -> recordAd(entry.url)
+                LineProbe.Result.Ad -> recordAd(entry.url, dropPick = false)
                 // With the TV itself offline (e.g. just after standby) every line fails; that says
                 // nothing about the lines, so it must not push working ones to the back.
                 LineProbe.Result.Dead -> if (online()) record(entry.url, ok = false, latency = null)
@@ -199,7 +204,14 @@ class LineRepository(context: Context) {
     private suspend fun probe(entry: PlaylistEntry): LineProbe.Result {
         val conns = Collections.synchronizedList(mutableListOf<HttpURLConnection>())
         val job = probeScope.async {
-            runCatching { LineProbe.run(entry, PROBE_TIMEOUT_MS) { conns += it } }.getOrDefault(LineProbe.Result.Dead)
+            // The redirect servers send only some requests to the advert; like the player, take
+            // the line for one only when every try hits it. Advert hits are a redirect or two, quick.
+            var result: LineProbe.Result = LineProbe.Result.Dead
+            for (i in 1..AdFilter.AD_RESOLVE_TRIES) {
+                result = runCatching { LineProbe.run(entry, PROBE_TIMEOUT_MS) { conns += it } }.getOrDefault(LineProbe.Result.Dead)
+                if (result != LineProbe.Result.Ad) break
+            }
+            result
         }
         val result = withTimeoutOrNull(PROBE_DEADLINE_MS) { job.await() } ?: LineProbe.Result.Dead
         if (job.isActive) {
