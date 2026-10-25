@@ -32,6 +32,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,19 +58,26 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.HlsManifest
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.tv.material3.Text
+import com.tritv.iptv.data.AdFilter
 import com.tritv.iptv.data.Channel
 import com.tritv.iptv.data.LineStat
 import com.tritv.iptv.data.PlaylistEntry
+import com.tritv.iptv.data.RedirectChain
 import com.tritv.iptv.epg.Programme
 import com.tritv.iptv.epg.nowAndNext
 import com.tritv.iptv.ui.ChannelBadge
@@ -93,6 +101,7 @@ import com.tritv.iptv.ui.NumberEntry
 import com.tritv.iptv.ui.tabular
 import com.tritv.iptv.ui.timeRange
 import kotlinx.coroutines.delay
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -109,6 +118,8 @@ fun PlayerScreen(
     onLineResult: (PlaylistEntry, Boolean) -> Unit,
     /** Called when a line the viewer switched to starts playing. */
     onLinePicked: (PlaylistEntry) -> Unit,
+    /** Called when a line turns out to play an advert loop instead of the channel. */
+    onLineAd: (PlaylistEntry) -> Unit,
     channelNumber: Int,
     programmes: List<Programme>,
     isFavorite: Boolean,
@@ -183,6 +194,10 @@ fun PlayerScreen(
     var showInfo by remember { mutableStateOf(true) }
     // Brief "已加入收藏 / 已取消收藏" note after the viewer toggles the favourite.
     var favoriteNote by remember { mutableStateOf<String?>(null) }
+    // Brief note that a line playing an advert or a frozen picture was left for another.
+    var lineNote by remember { mutableStateOf<String?>(null) }
+    // Watches the current attempt's HLS playlists for an advert; replaced with each attempt.
+    val adCheck = remember(channel) { arrayOf(AdCheck()) }
     // Set once a held OK has toggled the favourite, so its release does not also toggle the info bar.
     var okHeld by remember { mutableStateOf(false) }
     // Channel steps pressed in quick succession, applied together once the presses pause, so a
@@ -193,6 +208,10 @@ fun PlayerScreen(
     val jumpSeen = remember { intArrayOf(numberEntry.jumps, 0) } // number jumps seen; 1 while a zap is in flight
     val attempt = attempts[attemptIndex]
     val attemptStartedAt = remember(channel, attemptIndex) { System.currentTimeMillis() }
+
+    val lineUrls = remember(lines) { lines.map { it.url } }
+    // Read by the listener when it looks for the next line, so it sees the latest probes.
+    val latestStats by rememberUpdatedState(lineStats)
 
     // Keyed on channel so the listener sees this channel's attempt state.
     DisposableEffect(player, channel, lines) {
@@ -216,12 +235,51 @@ fun PlayerScreen(
             }
 
             override fun onPlayerError(e: PlaybackException) {
+                if (generateSequence<Throwable>(e) { it.cause }.any { it is AdRedirectException }) {
+                    leaveLine(adNote = true)
+                    return
+                }
                 onLineResult(lines[attempts[attemptIndex].sourceIndex], false)
                 val next = nextAttempt(attemptIndex, attempts.size, silentLine)
                 if (next == null) {
                     error = "所有线路都无法播放：" + playbackErrorReason(e.errorCode)
                 } else {
                     stayOnLine = next == silentLine
+                    attemptIndex = next
+                }
+            }
+
+            // Each load and live refresh of an HLS playlist lands here, so the advert check costs
+            // no requests of its own.
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                val manifest = player.currentManifest as? HlsManifest ?: return
+                val check = adCheck[0]
+                if (check.tripped) return
+                when (check.verdict(manifest)) {
+                    AdCheck.Verdict.OK -> {}
+                    AdCheck.Verdict.AD -> leaveLine(adNote = true)
+                    AdCheck.Verdict.FROZEN -> leaveLine(adNote = false)
+                }
+            }
+
+            /**
+             * Leaves the current line for the next usable one because it plays an advert
+             * ([adNote]) or a frozen recording. A line the viewer picked is left too: neither is
+             * what they wanted.
+             */
+            fun leaveLine(adNote: Boolean) {
+                adCheck[0].tripped = true
+                val line = attempts[attemptIndex].sourceIndex
+                if (adNote) onLineAd(lines[line]) else onLineResult(lines[line], false)
+                if (silentLine?.let { attempts[it].sourceIndex } == line) silentLine = null
+                stayOnLine = false
+                pickedByViewer = false
+                val next = nextLineAfterAd(attempts, lineUrls, latestStats, attemptIndex, System.currentTimeMillis())
+                if (next == null) {
+                    player.stop()
+                    error = if (adNote) "这个台的线路都在播广告" else "这个台的线路都放不出直播"
+                } else {
+                    lineNote = "线路 ${line + 1} " + (if (adNote) "在播广告" else "不是直播画面") + "，已换线路"
                     attemptIndex = next
                 }
             }
@@ -242,7 +300,6 @@ fun PlayerScreen(
     // Probes of this channel's lines start with it and answer well before the player gives up
     // on a dead line, so act on them: leave a line found dead, or one still loading after a
     // few seconds when another line is known to work.
-    val lineUrls = remember(lines) { lines.map { it.url } }
     val lineStat = lineStats[lineUrls[attempt.sourceIndex]]
     val channelStats = lineUrls.map { lineStats[it] }
     LaunchedEffect(attemptIndex, channelStats) {
@@ -264,6 +321,7 @@ fun PlayerScreen(
     LaunchedEffect(channel, attempt) {
         ready = false
         firstFrame = false
+        adCheck[0] = AdCheck()
         val source = lines[attempt.sourceIndex]
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent(source.userAgent ?: DEFAULT_USER_AGENT)
@@ -280,9 +338,13 @@ fun PlayerScreen(
         // once playing, ride out short network hiccups instead of switching lines.
         val retries = object : DefaultLoadErrorHandlingPolicy() {
             override fun getMinimumLoadableRetryCount(dataType: Int) = if (ready) 3 else 1
+            // The resolver has already tried the chain several times.
+            override fun getRetryDelayMsFor(info: LoadErrorHandlingPolicy.LoadErrorInfo) =
+                if (info.exception is AdRedirectException) C.TIME_UNSET else super.getRetryDelayMsFor(info)
         }
+        val dataSource = ResolvingDataSource.Factory(httpFactory, AdRedirectResolver(source, source.userAgent ?: DEFAULT_USER_AGENT))
         player.setMediaSource(
-            DefaultMediaSourceFactory(httpFactory).setLoadErrorHandlingPolicy(retries).createMediaSource(item),
+            DefaultMediaSourceFactory(dataSource).setLoadErrorHandlingPolicy(retries).createMediaSource(item),
         )
         player.prepare()
     }
@@ -325,6 +387,12 @@ fun PlayerScreen(
             delay(4_000)
             showInfo = false
         }
+    }
+
+    LaunchedEffect(lineNote) {
+        if (lineNote == null) return@LaunchedEffect
+        delay(3_000)
+        lineNote = null
     }
 
     LaunchedEffect(favoriteNote) {
@@ -484,7 +552,7 @@ fun PlayerScreen(
         }
 
         AnimatedVisibility(
-            visible = favoriteNote != null,
+            visible = favoriteNote != null || lineNote != null,
             enter = fadeIn(tween(200)),
             exit = fadeOut(tween(200)),
             // Centred: stations put their logo in a top corner.
@@ -499,8 +567,10 @@ fun PlayerScreen(
                     .background(TriTvColors.Ink.copy(alpha = 0.8f), Radius.Pill)
                     .padding(start = 12.dp, end = 16.dp),
             ) {
-                Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) { StarIcon(filled = isFavorite) }
-                Text(favoriteNote.orEmpty(), style = TriTvType.Caption)
+                if (favoriteNote != null) {
+                    Box(Modifier.size(16.dp), contentAlignment = Alignment.Center) { StarIcon(filled = isFavorite) }
+                }
+                Text(favoriteNote ?: lineNote.orEmpty(), style = TriTvType.Caption)
             }
         }
 
@@ -766,5 +836,67 @@ private fun KeyHint(key: String, label: String) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         KeyCap(key)
         Text(label, style = TriTvType.Small, color = TriTvColors.TextMuted)
+    }
+}
+
+/** The advert checks of [AdFilter] applied to one attempt's HLS playlists as the player loads them. */
+private class AdCheck {
+    private val loop = AdFilter.LoopWatch()
+    /** Set once the attempt has been found to be an advert, so it is left only once. */
+    var tripped = false
+
+    enum class Verdict { OK, AD, FROZEN }
+
+    @OptIn(UnstableApi::class)
+    fun verdict(manifest: HlsManifest): Verdict {
+        // After redirects, so the address the stream really came from.
+        if (AdFilter.isAdUrl(manifest.multivariantPlaylist.baseUri)) return Verdict.AD
+        val media = manifest.mediaPlaylist
+        if (AdFilter.isAdUrl(media.baseUri)) return Verdict.AD
+        val uris = media.segments.map { it.url }
+        if (uris.any(AdFilter::isAdUrl)) return Verdict.AD
+        if (media.hasEndTag && uris.isNotEmpty() && media.durationUs < AdFilter.MAX_CLIP_SECONDS * 1_000_000L) return Verdict.AD
+        if (loop.check(media.mediaSequence, uris)) return Verdict.AD
+        val lag = System.currentTimeMillis() - media.startTimeUs / 1_000
+        if (media.hasProgramDateTime && lag > AdFilter.MAX_LAG_MS) return Verdict.FROZEN
+        return Verdict.OK
+    }
+}
+
+/** Thrown when every try at a line's redirect chain passed through an advert address. */
+private class AdRedirectException(url: String) : IOException("advert redirect: $url")
+
+/**
+ * Walks the redirects of [source]'s address before each load of it (the first playlist and
+ * every live refresh, which go through the redirect server again) and hands the player the
+ * address they end at, so a hop through an advert server is seen: the player's own redirect
+ * handling shows only where the chain ends, which looks like the channel. A hop to an advert is
+ * tried again, as the server sends only some requests there; when every try hits one the load
+ * fails with [AdRedirectException]. A line that answers without a redirect is left alone after
+ * the first load, so only redirected lines pay for the extra request.
+ */
+@OptIn(UnstableApi::class)
+private class AdRedirectResolver(private val source: PlaylistEntry, private val userAgent: String) : ResolvingDataSource.Resolver {
+    @Volatile private var redirects = true
+
+    override fun resolveDataSpec(dataSpec: DataSpec): DataSpec {
+        if (!redirects || dataSpec.uri.toString() != source.url) return dataSpec
+        repeat(AdFilter.AD_RESOLVE_TRIES) {
+            when (val r = RedirectChain.resolve(source.url, userAgent, source.referrer, RESOLVE_TIMEOUT_MS)) {
+                RedirectChain.Result.Direct -> {
+                    redirects = false
+                    return dataSpec
+                }
+                is RedirectChain.Result.Final -> return dataSpec.withUri(android.net.Uri.parse(r.url))
+                // Let the player load it and report its own error.
+                RedirectChain.Result.Failed -> return dataSpec
+                RedirectChain.Result.Ad -> {}
+            }
+        }
+        throw AdRedirectException(source.url)
+    }
+
+    private companion object {
+        const val RESOLVE_TIMEOUT_MS = 6_000
     }
 }

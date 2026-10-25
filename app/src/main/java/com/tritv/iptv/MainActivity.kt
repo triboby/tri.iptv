@@ -79,6 +79,7 @@ class MainActivity : ComponentActivity() {
                                 lineStats = lineStats,
                                 onLineResult = viewModel::reportLine,
                                 onLinePicked = viewModel::pickLine,
+                                onLineAd = viewModel::reportAd,
                                 channelNumber = playing + 1,
                                 programmes = state.programmesOf(channel),
                                 isFavorite = state.isFavorite(channel),

@@ -378,6 +378,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         lines.report(entry, ok)
     }
 
+    /** Records that [entry] of the playing channel showed an advert instead of the channel. */
+    fun reportAd(entry: PlaylistEntry) = lines.reportAd(entry)
+
     /** Remembers [entry] as the line the viewer chose for the playing channel. */
     fun pickLine(entry: PlaylistEntry) {
         val s = _state.value

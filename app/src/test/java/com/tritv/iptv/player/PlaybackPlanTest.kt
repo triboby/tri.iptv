@@ -94,4 +94,26 @@ class ProbeSwitchTest {
         val stats = mapOf("a" to LineStat(latencyMs = 500, okAt = 1_100), "b" to LineStat(latencyMs = 50, okAt = 1_100))
         assertNull(probeSwitch(attempts, urls, stats, current = 0, startedAt = 1_000, now = 10_000))
     }
+
+    @Test
+    fun advertMovesToNextLineSkippingDeadAndAdvertLines() {
+        val mixed = listOf(Attempt(0, null), Attempt(1, MimeTypes.APPLICATION_M3U8), Attempt(1, null), Attempt(2, null), Attempt(3, null))
+        val lines = listOf("a", "b", "c", "d")
+        val stats = mapOf("c" to LineStat(failAt = 1_500), "d" to LineStat(okAt = 1_500))
+        assertEquals(1, nextLineAfterAd(mixed, lines, stats, current = 0, now = 2_000))
+        // Not the advert line's other format, nor the dead line c.
+        assertEquals(4, nextLineAfterAd(mixed, lines, stats, current = 1, now = 2_000))
+        val adD = stats + ("d" to LineStat(okAt = 1_900, failAt = 1_800, adAt = 1_800))
+        assertEquals(0, nextLineAfterAd(mixed, lines, adD, current = 1, now = 2_000))
+    }
+
+    @Test
+    fun advertWrapsToEarlierLinesThenGivesUp() {
+        assertEquals(0, nextLineAfterAd(attempts, urls, emptyMap(), current = 2, now = 2_000))
+        val allAds = urls.associateWith { LineStat(failAt = 1_900, adAt = 1_900) }
+        assertNull(nextLineAfterAd(attempts, urls, allAds, current = 0, now = 2_000))
+        // A line that worked since its advert is still worth a try.
+        val recovered = allAds + ("c" to LineStat(okAt = 1_950, failAt = 1_900, adAt = 1_900))
+        assertEquals(2, nextLineAfterAd(attempts, urls, recovered, current = 0, now = 2_000))
+    }
 }

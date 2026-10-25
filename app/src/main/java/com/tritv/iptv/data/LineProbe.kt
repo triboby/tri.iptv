@@ -12,32 +12,47 @@ import java.net.URL
  */
 internal object LineProbe {
 
-    /** Time in ms to the first byte of the first response, or null if the line does not deliver media. */
-    fun run(entry: PlaylistEntry, timeoutMs: Int, track: (HttpURLConnection) -> Unit = {}): Int? {
+    /** What a probe found. */
+    sealed interface Result {
+        /** The line delivers media; [latencyMs] to the first byte of the first response. */
+        data class Ok(val latencyMs: Int) : Result
+        data object Dead : Result
+        /** The line answers with an advert loop instead of the channel ([AdFilter]). */
+        data object Ad : Result
+    }
+
+    fun run(entry: PlaylistEntry, timeoutMs: Int, track: (HttpURLConnection) -> Unit = {}): Result {
         val start = System.nanoTime()
         var latency: Int? = null
         var url = entry.url
+        if (AdFilter.isAdUrl(url)) return Result.Ad
         // Set once [url] is a media segment, which only needs its first bytes.
         var segment = false
         repeat(MAX_STEPS) {
-            val body = fetch(url, entry, timeoutMs, segment, track) ?: return null
+            val body = fetch(url, entry, timeoutMs, segment, track) ?: return Result.Dead
+            if (body.ad) return Result.Ad
             if (latency == null) latency = ((System.nanoTime() - start) / 1_000_000).toInt()
-            val text = body.playlist ?: return if (body.html) null else latency
+            val ok = Result.Ok(latency!!)
+            val text = body.playlist ?: return if (body.html) Result.Dead else ok
+            val master = isMaster(text)
+            if (!master && AdFilter.isLoopPlaylist(text)) return Result.Ad
+            if (!master && AdFilter.isFrozen(text, System.currentTimeMillis())) return Result.Dead
             // An empty live playlist is still a working line; the next refresh will have segments.
-            val next = nextUri(text) ?: return latency
-            segment = !isMaster(text)
+            val next = nextUri(text) ?: return ok
+            segment = !master
             url = URL(URL(body.finalUrl), next).toString()
+            if (AdFilter.isAdUrl(url)) return Result.Ad
         }
-        return latency
+        return latency?.let { Result.Ok(it) } ?: Result.Dead
     }
+
+    /** Whether [playlist] lists variants rather than media segments. */
+    fun isMaster(playlist: String): Boolean = playlist.contains("#EXT-X-STREAM-INF")
 
     /**
      * The URI the player would load next from an HLS playlist: the first variant of a master
      * playlist, or the newest segment of a media playlist. Null when it lists none.
      */
-    /** Whether [playlist] lists variants rather than media segments. */
-    fun isMaster(playlist: String): Boolean = playlist.contains("#EXT-X-STREAM-INF")
-
     fun nextUri(playlist: String): String? {
         val lines = playlist.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
         val variant = lines.indexOfFirst { it.startsWith("#EXT-X-STREAM-INF") }
@@ -48,7 +63,7 @@ internal object LineProbe {
     /** Whether [head], the start of a response, is an HLS playlist. */
     fun isPlaylist(head: String): Boolean = head.trimStart('﻿', ' ', '\t', '\r', '\n').startsWith("#EXTM3U")
 
-    private class Body(val finalUrl: String, val playlist: String?, val html: Boolean)
+    private class Body(val finalUrl: String, val playlist: String?, val html: Boolean, val ad: Boolean = false)
 
     private fun fetch(start: String, entry: PlaylistEntry, timeoutMs: Int, segment: Boolean, track: (HttpURLConnection) -> Unit): Body? {
         var url = URL(start)
@@ -67,6 +82,7 @@ internal object LineProbe {
                 val code = conn.responseCode
                 if (code in 300..399) {
                     url = URL(url, conn.getHeaderField("Location") ?: return null)
+                    if (AdFilter.isAdUrl(url.toString())) return Body(url.toString(), null, html = false, ad = true)
                     return@repeat
                 }
                 if (code !in 200..299) return null

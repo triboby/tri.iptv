@@ -64,7 +64,7 @@ internal fun probeSwitch(
 ): Int? {
     val line = attempts[current].sourceIndex
     fun statOf(i: Int) = stats[lineUrls[attempts[i].sourceIndex]]
-    fun working(s: LineStat?) = s != null && !s.failing && s.okAt > startedAt - FRESH_MS
+    fun working(s: LineStat?) = s != null && !s.failing && s.okAt > startedAt - FRESH_MS && !s.adRecently(now)
     val cur = statOf(current)
     val dead = cur != null && cur.failing && cur.failAt > startedAt
     if (!dead && (now - startedAt < SLOW_START_MS || working(cur))) return null
@@ -74,6 +74,31 @@ internal fun probeSwitch(
         ?.let { return it }
     if (!dead) return null
     return others.firstOrNull { it > current && statOf(it)?.failing != true }
+}
+
+/**
+ * The attempt to move to once attempt [current] has shown an advert: the first attempt of another
+ * line, after it and then before it (the viewer may have stepped past them), preferring lines
+ * neither dead nor seen with an advert lately, then ones that worked since their advert (the
+ * player checks them as it loads), then any not last seen as an advert. Null when none is left.
+ */
+internal fun nextLineAfterAd(
+    attempts: List<Attempt>,
+    lineUrls: List<String>,
+    stats: Map<String, LineStat>,
+    current: Int,
+    now: Long,
+): Int? {
+    val line = attempts[current].sourceIndex
+    fun statOf(i: Int) = stats[lineUrls[attempts[i].sourceIndex]]
+    fun firstOfLine(i: Int) = i == 0 || attempts[i - 1].sourceIndex != attempts[i].sourceIndex
+    val candidates = ((current + 1 until attempts.size) + (0 until current))
+        .filter { attempts[it].sourceIndex != line && firstOfLine(it) }
+    fun ad(i: Int) = statOf(i)?.adRecently(now) == true
+    fun failing(i: Int) = statOf(i)?.failing == true
+    return candidates.firstOrNull { !ad(it) && !failing(it) }
+        ?: candidates.firstOrNull { ad(it) && !failing(it) }
+        ?: candidates.firstOrNull { !ad(it) }
 }
 
 /** A short Chinese reason for the error that ended the last line, for the player's info bar. */

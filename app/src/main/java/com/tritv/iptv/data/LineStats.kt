@@ -9,9 +9,18 @@ data class LineStat(
     val latencyMs: Int? = null,
     val okAt: Long = 0L,
     val failAt: Long = 0L,
+    /** When the line last turned out to be an advert loop ([AdFilter]); 0 if never. */
+    val adAt: Long = 0L,
 ) {
     /** The latest result was a failure. */
     val failing: Boolean get() = failAt > okAt
+
+    /**
+     * Whether the line showed an advert within [AD_HOLD_MS] before [now]. The redirect servers
+     * behind such lines send only some requests to the advert, so a line that worked on a later
+     * probe is still ranked after lines that never showed one.
+     */
+    fun adRecently(now: Long): Boolean = adAt > 0L && now - adAt < AD_HOLD_MS
 
     /** When the line was last checked either way. */
     val checkedAt: Long get() = maxOf(okAt, failAt)
@@ -27,6 +36,13 @@ data class LineStat(
     )
 
     fun failed(at: Long) = copy(failAt = at)
+
+    fun showedAd(at: Long) = copy(failAt = at, adAt = at)
+
+    companion object {
+        /** How long a line that showed an advert stays at the back of its channel's lines. */
+        const val AD_HOLD_MS = 6 * 60 * 60_000L
+    }
 }
 
 object LineRanker {
@@ -34,15 +50,20 @@ object LineRanker {
     /**
      * Indices into [urls] in the order to try them: the line the viewer picked (unless it has
      * since failed), then working lines fastest first, then lines not checked yet, then lines
-     * whose last check failed, those that worked most recently first. Ties keep the playlist order.
+     * whose last check failed, those that worked most recently first. A line that showed an
+     * advert lately ranks after the clean working lines once it has worked again (the player
+     * checks it on every load), and last of all while its latest check was the advert; it stays
+     * first only when picked and working since. Ties keep the playlist order.
      */
-    fun order(urls: List<String>, stats: Map<String, LineStat>, picked: String?): List<Int> {
+    fun order(urls: List<String>, stats: Map<String, LineStat>, picked: String?, now: Long = System.currentTimeMillis()): List<Int> {
         fun tier(i: Int): Int {
             val s = stats[urls[i]]
             return when {
                 urls[i] == picked && s?.failing != true -> 0
-                s == null || s.checkedAt == 0L -> 2
-                s.failing -> 3
+                s == null || s.checkedAt == 0L -> 3
+                s.failing && s.adRecently(now) -> 5
+                s.failing -> 4
+                s.adRecently(now) -> 2
                 else -> 1
             }
         }
@@ -61,16 +82,18 @@ object LineRanker {
     fun probeable(url: String): Boolean =
         url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)
 
-    /** One stat per line, "latency|okAt|failAt" with an empty latency when unknown. */
-    fun encode(stat: LineStat): String = "${stat.latencyMs ?: ""}|${stat.okAt}|${stat.failAt}"
+    /** One stat per line, "latency|okAt|failAt|adAt" with an empty latency when unknown. */
+    fun encode(stat: LineStat): String = "${stat.latencyMs ?: ""}|${stat.okAt}|${stat.failAt}|${stat.adAt}"
 
+    /** Also reads the older "latency|okAt|failAt" form. */
     fun decode(text: String?): LineStat? {
         val parts = text?.split('|') ?: return null
-        if (parts.size != 3) return null
+        if (parts.size !in 3..4) return null
         return LineStat(
             latencyMs = parts[0].toIntOrNull(),
             okAt = parts[1].toLongOrNull() ?: return null,
             failAt = parts[2].toLongOrNull() ?: return null,
+            adAt = if (parts.size == 4) parts[3].toLongOrNull() ?: return null else 0L,
         )
     }
 }
