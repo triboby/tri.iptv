@@ -54,6 +54,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -145,6 +146,15 @@ fun PlayerScreen(
     val player = remember {
         ExoPlayer.Builder(context, TvRenderersFactory(context))
             .setLoadControl(liveLoadControl())
+            // Holding audio focus makes the player go quiet when another app starts playing,
+            // even if this screen is still alive behind it.
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                    .build(),
+                true,
+            )
             .build()
             .apply { playWhenReady = true }
     }
@@ -158,12 +168,18 @@ fun PlayerScreen(
     DisposableEffect(lifecycleOwner, player) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_STOP -> player.stop()
+                Lifecycle.Event.ON_STOP -> {
+                    player.playWhenReady = false
+                    player.stop()
+                }
                 // Back to the live edge: the old position may have left the live window, which
                 // would fail as an error and wrongly move on to the next line.
-                Lifecycle.Event.ON_START -> if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
-                    player.seekToDefaultPosition()
-                    player.prepare()
+                Lifecycle.Event.ON_START -> {
+                    player.playWhenReady = true
+                    if (player.playbackState == Player.STATE_IDLE && player.mediaItemCount > 0) {
+                        player.seekToDefaultPosition()
+                        player.prepare()
+                    }
                 }
                 else -> {}
             }
@@ -346,7 +362,9 @@ fun PlayerScreen(
         player.setMediaSource(
             DefaultMediaSourceFactory(dataSource).setLoadErrorHandlingPolicy(retries).createMediaSource(item),
         )
-        player.prepare()
+        // A line switch can land while the app is hidden (a probe or timer firing late); leave the
+        // line loaded but idle then, and ON_START connects it.
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) player.prepare()
     }
 
     // The loading ring stays up from the start of buffering until the line plays, whatever the info
